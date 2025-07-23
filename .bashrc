@@ -120,3 +120,4 @@ fi
 --CUSTOM ADDITIONS
 eval "$(zoxide init bash)"
 alias config='/usr/bin/git --git-dir=/home/dakamakat/.cfg/ --work-tree=/home/dakamakat'
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/bin:/home/dakamakat/.dotnet/tools:/home/dakamakat/bin
