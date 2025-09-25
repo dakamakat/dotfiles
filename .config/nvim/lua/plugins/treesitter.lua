@@ -14,10 +14,13 @@ return {
         "query",
         "regex",
         "tsx",
-        "c_sharp",
         "typescript",
         "vim",
         "yaml",
+
+        -- !!
+        "razor",
+        "c_sharp",
       },
     },
   },

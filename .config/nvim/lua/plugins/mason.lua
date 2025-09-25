@@ -1,14 +1,18 @@
 return {
   {
-    "williamboman/mason.nvim",
-    lazy = true,
-    config = function()
-      require("mason").setup({
-        registries = {
-          "github:Crashdummyy/mason-registry",
-          "github:mason-org/mason-registry",
+    "mason-org/mason.nvim",
+    opts = {
+      ui = {
+        icons = {
+          package_installed = "✓",
+          package_pending = "➜",
+          package_uninstalled = "✗",
         },
-      })
-    end,
+      },
+      registries = {
+        "github:mason-org/mason-registry",
+        "github:Crashdummyy/mason-registry",
+      },
+    },
   },
 }
