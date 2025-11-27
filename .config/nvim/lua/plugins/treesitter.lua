@@ -21,6 +21,7 @@ return {
         -- !!
         "razor",
         "c_sharp",
+        "rust",
       },
     },
   },
