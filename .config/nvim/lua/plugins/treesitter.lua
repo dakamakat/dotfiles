@@ -7,6 +7,7 @@ return {
         "html",
         "javascript",
         "json",
+        "jsonc",
         "lua",
         "markdown",
         "markdown_inline",
@@ -18,7 +19,6 @@ return {
         "vim",
         "yaml",
 
-        -- !!
         "razor",
         "c_sharp",
         "rust",

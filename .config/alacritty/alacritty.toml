@@ -1,0 +1,13 @@
+
+[window]
+padding = { x = 10, y = 10 } # Adds a nice border around Neovim
+dynamic_padding = true
+opacity = 0.9 # Change to 0.95 if you want slight transparency
+
+[general]
+import = [
+    "~/.config/alacritty/themes/tokyo-night.toml"
+]
+[[keyboard.bindings]]
+key = "F11"
+action = "ToggleFullscreen"

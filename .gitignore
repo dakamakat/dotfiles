@@ -1,0 +1,9 @@
+# backups / editor leftovers
+*.bak
+*.save
+*~
+*.swp
+
+# kitty / alacritty local overrides
+.config/kitty/*.bak
+.config/kitty/*.save
