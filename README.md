@@ -35,9 +35,9 @@ title, type, tags and summary; the original content is kept untouched below the 
 
 | Hotkey / command | Does |
 | --- | --- |
-| `Super+Alt+N` | Quick capture, prefilled from the clipboard: a URL becomes an article note with the full text, anything else a note; copied files are offered as attachments |
-| `Super+Alt+F` | Pick files to add (PDFs and text files are read for the summary) |
-| `Super+Alt+O` | Open the vault in Obsidian |
+| `Super+N` | Quick capture, prefilled from the clipboard: a URL becomes an article note with the full text, anything else a note; copied files are offered as attachments |
+| `Super+F` | Pick files to add (PDFs and text files are read for the summary) |
+| `Super+O` | Open the vault in Obsidian |
 | `kb add URL\|FILE\|TEXT`, `… \| kb add -` | The same from a terminal |
 | `kb telegram [EXPORT]` | Import Saved Messages from a Telegram Desktop JSON export (newest one in `~/Downloads/Telegram Desktop` by default). Re-run on a newer export to pick up only new messages; junk goes to `Telegram/_Skipped.md` |
 | `kb save-config` | Copy the vault's `.obsidian` settings back here to commit (plugin `data.json` left out: this repo is public) |

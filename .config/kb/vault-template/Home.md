@@ -2,9 +2,9 @@
 
 | Hotkey | Does |
 | --- | --- |
-| `Super+Alt+N` | Quick capture, prefilled from the clipboard. A URL becomes an article note (full text pulled in), anything else a note. Copied files are offered as attachments. |
-| `Super+Alt+F` | Pick files to add (PDFs, images, docs, `.md` notes). |
-| `Super+Alt+O` | Open this vault. |
+| `Super+N` | Quick capture, prefilled from the clipboard. A URL becomes an article note (full text pulled in), anything else a note. Copied files are offered as attachments. |
+| `Super+F` | Pick files to add (PDFs, images, docs, `.md` notes). |
+| `Super+O` | Open this vault. |
 
 From a terminal: `kb add <url | file | text>`, `echo … | kb add -`.
 Telegram Saved Messages: export them as JSON from Telegram Desktop, then run `kb telegram`.

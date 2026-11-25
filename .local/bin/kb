@@ -5,9 +5,9 @@
 # ///
 """kb: put things into the Obsidian knowledge base, with Claude doing the filing.
 
-  kb capture               quick-capture dialog, prefilled from the clipboard   (Super+Alt+N)
-  kb file                  pick files and add them                              (Super+Alt+F)
-  kb open                  open the vault in Obsidian                           (Super+Alt+O)
+  kb capture               quick-capture dialog, prefilled from the clipboard   (Super+N)
+  kb file                  pick files and add them                              (Super+F)
+  kb open                  open the vault in Obsidian                           (Super+O)
   kb add URL|PATH|TEXT|-   add from the command line ("-" reads stdin)
   kb telegram [EXPORT]     import a Telegram Desktop JSON export of Saved Messages
   kb setup                 create the vault, register it with Obsidian, bind the hotkeys
@@ -698,9 +698,9 @@ def cmd_telegram(args) -> None:
 
 MK = "org.gnome.settings-daemon.plugins.media-keys"
 MK_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
-HOTKEYS = [("kb-capture", "Knowledge base: quick capture", "<Super><Alt>n", "capture"),
-           ("kb-file", "Knowledge base: add files", "<Super><Alt>f", "file"),
-           ("kb-open", "Knowledge base: open Obsidian", "<Super><Alt>o", "open")]
+HOTKEYS = [("kb-capture", "Knowledge base: quick capture", "<Super>n", "capture"),
+           ("kb-file", "Knowledge base: add files", "<Super>f", "file"),
+           ("kb-open", "Knowledge base: open Obsidian", "<Super>o", "open")]
 
 
 def gvariant_str(s: str) -> str:
@@ -722,6 +722,12 @@ def bind_hotkeys() -> None:
             subprocess.run(["gsettings", "set", schema, key, gvariant_str(val)], check=True)
         log(f"hotkey  {binding:<16} kb {sub}")
     subprocess.run(["gsettings", "set", MK, "custom-keybindings", str(cur)], check=True)
+    # GNOME gives Super+O to screen-rotation lock; the hardware rotation key keeps working
+    rot = subprocess.run(["gsettings", "get", MK, "rotate-video-lock-static"], capture_output=True, text=True)
+    if rot.returncode == 0 and "'<Super>o'" in rot.stdout:
+        keys = [k for k in ast.literal_eval(rot.stdout.replace("@as ", "").strip()) if k != "<Super>o"]
+        subprocess.run(["gsettings", "set", MK, "rotate-video-lock-static", str(keys)], check=True)
+        log("hotkey  freed <Super>o from GNOME's rotation lock")
 
 
 def register_vault() -> None:
