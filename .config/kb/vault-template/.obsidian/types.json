@@ -1,0 +1,12 @@
+{
+  "types": {
+    "tags": "tags",
+    "type": "text",
+    "summary": "text",
+    "source": "text",
+    "created": "datetime",
+    "published": "text",
+    "forwarded_from": "text",
+    "telegram_id": "number"
+  }
+}

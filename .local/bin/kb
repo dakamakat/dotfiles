@@ -1,0 +1,824 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["trafilatura>=2.0,<3"]
+# ///
+"""kb: put things into the Obsidian knowledge base, with Claude doing the filing.
+
+  kb capture               quick-capture dialog, prefilled from the clipboard   (Super+Alt+N)
+  kb file                  pick files and add them                              (Super+Alt+F)
+  kb open                  open the vault in Obsidian                           (Super+Alt+O)
+  kb add URL|PATH|TEXT|-   add from the command line ("-" reads stdin)
+  kb telegram [EXPORT]     import a Telegram Desktop JSON export of Saved Messages
+  kb setup                 create the vault, register it with Obsidian, bind the hotkeys
+  kb save-config           copy the vault's .obsidian settings back into the dotfiles
+
+A URL becomes an article note (full text pulled from the page), plain text becomes
+a note, files are copied into Attachments/ with a note that embeds them. Claude
+(`claude -p`, your normal Claude Code login) writes the title, type, tags and
+summary; the original content is always kept as-is below the frontmatter.
+
+Settings come from the environment or ~/.config/kb/local.env (not committed):
+  KB_VAULT   vault folder              (default ~/Documents/Knowledge)
+  KB_MODEL   Claude model for filing   (default sonnet; haiku is cheaper but mixes up languages)
+  KB_AI      0 disables Claude; titles then come from the first line / page title
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+import warnings
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from datetime import datetime
+from pathlib import Path
+
+warnings.filterwarnings("ignore", module="urllib3")  # its SOCKS-proxy notice
+HOME = Path.home()
+CONF_DIR = HOME / ".config" / "kb"
+
+
+def _load_local_env() -> None:
+    f = CONF_DIR / "local.env"
+    if not f.exists():
+        return
+    for line in f.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+
+
+_load_local_env()
+VAULT = Path(os.path.expandvars(os.path.expanduser(os.environ.get("KB_VAULT", "~/Documents/Knowledge"))))
+MODEL = os.environ.get("KB_MODEL", "sonnet")
+USE_AI = os.environ.get("KB_AI", "1") != "0"
+
+INBOX, TELEGRAM, ATTACH = "Inbox", "Telegram", "Attachments"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'`]+[^\s<>()\[\]{}\"'`.,;:!?]")
+TEXT_EXT = {".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".xml", ".html", ".log", ".ini", ".toml",
+            ".py", ".cs", ".js", ".ts", ".go", ".rs", ".java", ".sh", ".sql", ".lua"}
+INTERACTIVE = sys.stderr.isatty()
+
+
+# ── small helpers ─────────────────────────────────────────────────────────────
+
+def log(*a) -> None:
+    print(*a, file=sys.stderr, flush=True)
+
+
+def notify(summary: str, body: str = "") -> None:
+    log(summary + (f": {body}" if body else ""))
+    if not INTERACTIVE and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Knowledge base", "-i", "accessories-text-editor", summary, body],
+                       check=False)
+
+
+def die(msg: str) -> None:
+    notify("kb: error", msg)
+    sys.exit(1)
+
+
+def q(s) -> str:
+    """A YAML scalar: JSON strings are valid YAML double-quoted strings."""
+    return json.dumps(str(s), ensure_ascii=False)
+
+
+def frontmatter(fm: dict) -> str:
+    lines = ["---"]
+    for k, v in fm.items():
+        if v is None or v == "" or v == []:
+            continue
+        if isinstance(v, list):
+            lines.append(f"{k}:")
+            lines += [f"  - {q(x)}" for x in v]
+        elif isinstance(v, datetime):
+            lines.append(f"{k}: {v.strftime('%Y-%m-%dT%H:%M:%S')}")
+        elif isinstance(v, (bool, int, float)):
+            lines.append(f"{k}: {json.dumps(v)}")
+        else:
+            lines.append(f"{k}: {q(v)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def safe_name(s: str, maxlen: int = 100) -> str:
+    # characters Obsidian (or links to the file) can't handle
+    s = re.sub(r"[\\/:*?\"<>|#^\[\]\x00-\x1f]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s[:maxlen].rstrip(" .") or "Untitled"
+
+
+def unique_path(folder: Path, stem: str, ext: str) -> Path:
+    p, n = folder / f"{stem}{ext}", 2
+    while p.exists():
+        p, n = folder / f"{stem} {n}{ext}", n + 1
+    return p
+
+
+def write_note(folder: str, stem: str, fm: dict, body: str) -> Path:
+    d = VAULT / folder
+    d.mkdir(parents=True, exist_ok=True)
+    p = unique_path(d, safe_name(stem), ".md")
+    p.write_text(frontmatter(fm) + "\n" + body.strip() + "\n")
+    return p
+
+
+def copy_attachment(src: Path, sub: str = "", prefix: str = "") -> str:
+    """Copy into Attachments/<sub>/ and return the vault-relative path for an embed."""
+    d = VAULT / ATTACH / sub if sub else VAULT / ATTACH
+    d.mkdir(parents=True, exist_ok=True)
+    dst = unique_path(d, safe_name(prefix + src.stem, 120), src.suffix.lower())
+    shutil.copy2(src, dst)
+    return dst.relative_to(VAULT).as_posix()
+
+
+def clean_tags(tags) -> list[str]:
+    out = []
+    for t in tags or []:
+        t = re.sub(r"\s+", "-", str(t).strip().lstrip("#").lower())
+        t = re.sub(r"[^\w\-/]", "", t).strip("-/")
+        if t and not t.isdigit() and t not in out:
+            out.append(t)
+    return out
+
+
+def first_line_title(text: str) -> str:
+    for line in text.splitlines():
+        line = re.sub(r"[*_`>#]+", "", URL_RE.sub("", line)).strip()
+        if line:
+            return line[:70]
+    return ""
+
+
+def vault_tags() -> Counter:
+    """Tags already used in the vault's frontmatter, so Claude reuses them."""
+    c: Counter = Counter()
+    if not VAULT.exists():
+        return c
+    for p in VAULT.rglob("*.md"):
+        if ".obsidian" in p.parts:
+            continue
+        try:
+            head = p.read_text(errors="ignore")[:4000]
+        except OSError:
+            continue
+        m = re.match(r"---\n(.*?)\n---", head, re.S)
+        if not m:
+            continue
+        in_tags = False
+        for line in m.group(1).splitlines():
+            if line.startswith("tags:"):
+                rest = line[5:].strip()
+                if rest.startswith("["):
+                    c.update(clean_tags(x.strip(" \"'") for x in rest.strip("[]").split(",")))
+                in_tags = not rest
+            elif in_tags and line.lstrip().startswith("- "):
+                c.update(clean_tags([line.lstrip()[2:].strip(" \"'")]))
+            else:
+                in_tags = False
+    return c
+
+
+# ── web pages ─────────────────────────────────────────────────────────────────
+
+def page_info(url: str, full: bool = False, timeout: int = 12) -> dict:
+    """Title/description (and, with full=True, the article as markdown) for a URL."""
+    info: dict = {}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,*/*;q=0.8"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            final = r.geturl()
+            ctype = r.headers.get_content_type()
+            if ctype not in ("text/html", "application/xhtml+xml"):
+                return {"content_type": ctype}
+            html = r.read(5_000_000).decode(r.headers.get_content_charset() or "utf-8", "replace")
+    except Exception as e:  # network errors, 4xx/5xx, bad TLS ...
+        return {"error": str(e)[:200]}
+
+    import trafilatura
+
+    try:
+        md = trafilatura.extract_metadata(html, default_url=final)
+        if md:
+            info.update(title=md.title, description=md.description, site=md.sitename,
+                        author=md.author, published=md.date)
+    except Exception:
+        pass
+    if not info.get("title"):
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+        if m:
+            info["title"] = re.sub(r"\s+", " ", m.group(1)).strip()
+    if full:
+        try:
+            info["markdown"] = trafilatura.extract(
+                html, url=final, output_format="markdown", include_links=True,
+                include_images=True, include_tables=True, include_comments=False) or ""
+        except Exception:
+            info["markdown"] = ""
+    return {k: v for k, v in info.items() if v}
+
+
+# ── Claude ────────────────────────────────────────────────────────────────────
+
+TYPES = ["article", "video", "tool", "repo", "course", "book", "idea", "note", "snippet",
+         "quote", "todo", "recipe", "place", "media", "other"]
+
+SYSTEM = f"""You file items into a personal Obsidian knowledge base. The owner saved each item \
+(a Telegram saved message, a web page, a pasted note or a file) because it seemed worth keeping. \
+For every item return an object with:
+- id: the item's id, unchanged.
+- keep: false only for junk with no lasting value: empty or accidental messages, "test", "ok", \
+one-time codes, expired logistics (a parking spot, a delivery code, "I'm here"). When unsure, keep.
+- title: a specific, descriptive title of at most 70 characters, written in the item's `language`. \
+Say what it is about, not "Link" or "Message". No trailing period, no quotes, no emoji.
+- type: one of {", ".join(TYPES)}.
+- tags: 1 to 4 broad, reusable topic tags in English, lowercase-kebab-case (e.g. dotnet, \
+system-design, productivity, finance, health). Reuse tags from the existing-tags list whenever \
+one fits; invent a new one only when none does. Never tag the type or the source \
+(no "telegram", "link", "article", "message").
+- summary: one or two sentences in the item's `language`, saying what it is and why it \
+is useful. Don't comment on attachments or missing content. Empty string when the item is shorter \
+than its summary would be.
+Every item states its own `language`, and items in one request often differ: write each item's title \
+and summary in that item's `language` only, never in the language of the other items.
+For items that are mostly a link, rely on the page title/description given. Never invent facts \
+that are not in the item. Return exactly one object per input item."""
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "keep": {"type": "boolean"},
+            "title": {"type": "string"},
+            "type": {"type": "string", "enum": TYPES},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"},
+        },
+        "required": ["id", "keep", "title", "type", "tags", "summary"],
+        "additionalProperties": False,
+    }}},
+    "required": ["items"],
+    "additionalProperties": False,
+}
+
+
+def detect_lang(text: str) -> str:
+    text = URL_RE.sub("", text)
+    cyr = len(re.findall(r"[а-яёіїєґ]", text, re.I))
+    lat = len(re.findall(r"[a-z]", text, re.I))
+    if cyr and cyr >= 0.3 * (cyr + lat):
+        return "Ukrainian" if re.search(r"[іїєґ]", text, re.I) else "Russian"
+    return "English"
+
+
+def with_language(item: dict) -> dict:
+    """Tell Claude which language to write in: the owner's own words decide, else the page/file."""
+    own = " ".join(str(item.get(k) or "") for k in ("text", "owner_comment", "file_text"))
+    if len(re.findall(r"[^\W\d_]", URL_RE.sub("", own))) < 10:
+        own += " " + " ".join(str(item.get(k) or "") for k in
+                              ("link_title", "link_description", "page_title", "page_description", "page_text",
+                               "file_name"))
+    return {"language": item.get("language") or detect_lang(own), **{k: v for k, v in item.items() if k != "language"}}
+
+
+def ai_classify(items: list[dict], known_tags: list[str]) -> dict[str, dict] | None:
+    """items: [{"id": str, ...context}] -> {id: {keep,title,type,tags,summary}}, or None."""
+    if not USE_AI or not items:
+        return None
+    claude = shutil.which("claude") or str(HOME / ".local/bin/claude")
+    if not Path(claude).exists():
+        log("kb: `claude` not found, filing without AI")
+        return None
+    prompt = (f"Existing tags: {', '.join(known_tags) or '(none yet)'}\n\n"
+              f"Items:\n{json.dumps([with_language(i) for i in items], ensure_ascii=False, indent=1)}")
+    cmd = [claude, "-p", "--model", MODEL, "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+           "--setting-sources", "", "--output-format", "json", "--system-prompt", SYSTEM,
+           "--json-schema", json.dumps(SCHEMA)]
+    err = ""
+    for _ in range(2):
+        try:
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300,
+                               cwd=tempfile.gettempdir())
+            out = json.loads(r.stdout)
+            so = out.get("structured_output")
+            if out.get("is_error") or not so:
+                raise RuntimeError(out.get("result") or r.stderr[:300])
+            return {str(x["id"]): x for x in so["items"]}
+        except Exception as e:
+            err = str(e)[:300]
+    log(f"kb: Claude failed ({err}), filing {len(items)} item(s) without AI")
+    return None
+
+
+def ai_one(item: dict) -> dict | None:
+    res = ai_classify([dict(item, id="1")], [t for t, _ in vault_tags().most_common(150)])
+    return (res or {}).get("1")
+
+
+# ── capture: urls, text, files ────────────────────────────────────────────────
+
+def add_url(url: str, comment: str = "") -> Path:
+    info = page_info(url, full=True)
+    article = info.get("markdown", "")
+    item = {"kind": "web page", "url": url, "page_title": info.get("title"),
+            "page_description": info.get("description"), "owner_comment": comment or None,
+            "page_text": article[:6000] or None}
+    meta = ai_one({k: v for k, v in item.items() if v}) or {}
+    title = meta.get("title") or info.get("title") or url
+    fm = {"type": meta.get("type") or ("article" if article else "other"), "tags": clean_tags(meta.get("tags")),
+          "summary": meta.get("summary"), "source": url, "site": info.get("site"), "author": info.get("author"),
+          "published": info.get("published"), "created": datetime.now()}
+    body = f"[{info.get('title') or url}]({url})\n"
+    if comment:
+        body += f"\n{comment}\n"
+    if article:
+        body += f"\n---\n\n{article}\n"
+    elif info.get("description"):
+        body += f"\n> {info['description']}\n"
+    return write_note(INBOX, title, fm, body)
+
+
+def add_text(text: str) -> Path:
+    urls = URL_RE.findall(text)
+    rest = URL_RE.sub("", text).strip()
+    if len(urls) == 1 and len(rest) <= 500:
+        return add_url(urls[0], comment=rest)
+    meta = ai_one({"kind": "note typed or pasted by the owner", "text": text[:8000]}) or {}
+    title = meta.get("title") or first_line_title(text) or f"Note {datetime.now():%Y-%m-%d %H%M}"
+    fm = {"type": meta.get("type") or "note", "tags": clean_tags(meta.get("tags")),
+          "summary": meta.get("summary") if len(text) > 400 else None,
+          "source": urls[0] if len(urls) == 1 else None, "created": datetime.now()}
+    return write_note(INBOX, title, fm, text)
+
+
+def file_text(p: Path) -> str:
+    if p.suffix.lower() in TEXT_EXT:
+        return p.read_text(errors="ignore")[:6000]
+    if p.suffix.lower() == ".pdf" and shutil.which("pdftotext"):
+        r = subprocess.run(["pdftotext", "-l", "5", "-q", str(p), "-"], capture_output=True, text=True)
+        return r.stdout[:6000]
+    return ""
+
+
+def add_file(p: Path) -> Path:
+    if p.suffix.lower() in (".md", ".markdown"):  # already a note: bring it in as-is
+        (VAULT / INBOX).mkdir(parents=True, exist_ok=True)
+        dst = unique_path(VAULT / INBOX, safe_name(p.stem), ".md")
+        shutil.copy2(p, dst)
+        return dst
+    rel = copy_attachment(p)
+    text = file_text(p)
+    meta = (ai_one({"kind": "file", "file_name": p.name, "file_text": text}) if text else None) or {}
+    fm = {"type": meta.get("type") or "media", "tags": clean_tags(meta.get("tags")), "summary": meta.get("summary"),
+          "file": p.name, "created": datetime.now()}
+    return write_note(INBOX, meta.get("title") or p.stem, fm, f"![[{rel}]]\n")
+
+
+def add_paths(paths: list[Path]) -> None:
+    paths = [p for p in paths if p.is_file()]
+    if not paths:
+        die("no files to add")
+    notes = [add_file(p) for p in paths]
+    notify(f"Added {len(notes)} file(s) to Inbox", ", ".join(n.stem for n in notes)[:200])
+
+
+def read_clipboard() -> tuple[str, object]:
+    """('files', [Path]) or ('text', str)."""
+    def run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return r.stdout if r.returncode == 0 else ""
+
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        types = run(["wl-paste", "--list-types"]).split()
+        for t in ("x-special/gnome-copied-files", "text/uri-list"):
+            if t in types:
+                files = [Path(urllib.parse.unquote(urllib.parse.urlparse(u.strip()).path))
+                         for u in run(["wl-paste", "--type", t]).splitlines() if u.strip().startswith("file://")]
+                if files:
+                    return "files", files
+        return "text", run(["wl-paste", "--no-newline", "--type", "text"]) if types else ""
+    if shutil.which("xclip"):
+        return "text", run(["xclip", "-o", "-selection", "clipboard"])
+    return "text", ""
+
+
+def zenity(*args: str) -> str | None:
+    if not shutil.which("zenity"):
+        die("zenity is not installed (sudo apt install zenity)")
+    r = subprocess.run(["zenity", *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def cmd_capture(_args) -> None:
+    kind, clip = read_clipboard()
+    if kind == "files":
+        names = "\n".join(p.name for p in clip[:10])
+        if zenity("--question", "--title", "Add to knowledge base", "--ok-label", "Add",
+                  "--text", f"Add {len(clip)} copied file(s) to the Inbox?\n\n{names}") is not None:
+            add_paths(clip)
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(clip if len(clip) < 20000 else "")
+    try:
+        text = zenity("--text-info", "--editable", "--filename", f.name, "--width", "760", "--height", "480",
+                      "--title", "Add to knowledge base    ·    a URL becomes an article, anything else a note",
+                      "--ok-label", "Save", "--cancel-label", "Cancel")
+    finally:
+        os.unlink(f.name)
+    if not text:
+        return
+    notify("Saving to knowledge base…")
+    note = add_text(text)
+    notify("Saved to Inbox", note.stem)
+
+
+def cmd_file(_args) -> None:
+    out = zenity("--file-selection", "--multiple", "--separator", "\n", "--title", "Add files to knowledge base")
+    if out:
+        add_paths([Path(p) for p in out.splitlines()])
+
+
+def cmd_add(args) -> None:
+    if args.what == ["-"]:
+        text = sys.stdin.read()
+    elif len(args.what) == 1 and Path(args.what[0]).expanduser().is_file():
+        return add_paths([Path(args.what[0]).expanduser()])
+    else:
+        text = " ".join(args.what)
+    if not text.strip():
+        die("nothing to add")
+    note = add_text(text.strip())
+    notify("Saved to Inbox", note.stem)
+
+
+def cmd_open(_args) -> None:
+    subprocess.Popen(["xdg-open", "obsidian://open?vault=" + urllib.parse.quote(VAULT.name)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ── Telegram import ───────────────────────────────────────────────────────────
+
+def find_export(arg: str | None) -> Path:
+    if arg:
+        p = Path(arg).expanduser()
+        p = p / "result.json" if p.is_dir() else p
+        if not p.exists():
+            die(f"{p} not found")
+        return p
+    cands = sorted(HOME.glob("Downloads/Telegram Desktop/*Export_*/result.json"), key=lambda p: p.stat().st_mtime)
+    if not cands:
+        die("no export found in ~/Downloads/Telegram Desktop/; pass the export folder")
+    return cands[-1]
+
+
+def load_export(p: Path) -> list[dict]:
+    data = json.loads(p.read_text())
+    if "messages" in data:
+        msgs = data["messages"]
+    else:  # a full-account export
+        chats = [c for c in data.get("chats", {}).get("list", []) if c.get("type") == "saved_messages"]
+        if not chats:
+            die("no Saved Messages chat in this export")
+        msgs = chats[0]["messages"]
+    return [m for m in msgs if m.get("type") == "message"]
+
+
+def _wrap(s: str, mark: str) -> str:
+    """**bold** etc. with whitespace kept outside the markers, which markdown needs."""
+    core = s.strip()
+    if not core:
+        return s
+    lead, trail = s[: len(s) - len(s.lstrip())], s[len(s.rstrip()):]
+    return f"{lead}{mark}{core}{mark}{trail}"
+
+
+def entities_to_md(ents: list) -> str:
+    out = []
+    for e in ents:
+        if isinstance(e, str):
+            out.append(e)
+            continue
+        t, s = e.get("type"), e.get("text", "")
+        if t == "bold":
+            s = _wrap(s, "**")
+        elif t == "italic":
+            s = _wrap(s, "*")
+        elif t == "strikethrough":
+            s = _wrap(s, "~~")
+        elif t == "code":
+            s = f"`{s}`"
+        elif t == "pre":
+            s = f"\n```{e.get('language', '')}\n{s.strip(chr(10))}\n```\n"
+        elif t == "text_link":
+            s = f"[{s}]({e.get('href', '')})"
+        elif t == "blockquote":
+            s = "\n" + "\n".join("> " + line for line in s.splitlines()) + "\n"
+        out.append(s)
+    return "".join(out)
+
+
+def entity_urls(ents: list, plain: str) -> list[str]:
+    urls = [e["href"] for e in ents if isinstance(e, dict) and e.get("type") == "text_link" and e.get("href")]
+    urls += URL_RE.findall(plain)
+    return list(dict.fromkeys(u for u in urls if u.startswith("http")))
+
+
+MEDIA_LABEL = {"sticker": "Sticker", "animation": "GIF", "video_file": "Video", "video_message": "Video message",
+               "voice_message": "Voice message", "audio_file": "Audio"}
+
+
+def tg_item(m: dict, root: Path) -> dict:
+    ents = m.get("text_entities")
+    if ents is None:
+        t = m.get("text", "")
+        ents = t if isinstance(t, list) else [t]
+    plain = "".join(e if isinstance(e, str) else e.get("text", "") for e in ents)
+    media, missing = [], []
+    for key in ("photo", "file"):
+        v = m.get(key)
+        if isinstance(v, str) and v:
+            if v.startswith("(File"):
+                missing.append(m.get("file_name") or key)
+            else:
+                media.append(root / v)
+    kind = m.get("media_type") or ("photo" if "photo" in m else "file" if "file" in m else None)
+    extra = []
+    if m.get("poll"):
+        poll = m["poll"]
+        extra.append(f"Poll: {poll.get('question', '')}\n" + "\n".join(f"- {a.get('text', '')}" for a in poll.get("answers", [])))
+    if loc := m.get("location_information"):
+        extra.append(f"Location: https://maps.google.com/?q={loc.get('latitude')},{loc.get('longitude')}"
+                     + (f" ({m['place_name']})" if m.get("place_name") else ""))
+    if c := m.get("contact_information"):
+        extra.append(f"Contact: {c.get('first_name', '')} {c.get('last_name', '')} {c.get('phone_number', '')}".strip())
+    md = entities_to_md(ents).strip()
+    if extra:
+        md = (md + "\n\n" + "\n\n".join(extra)).strip()
+        plain = (plain + "\n" + "\n".join(extra)).strip()
+    return {
+        "id": str(m["id"]), "date": datetime.fromisoformat(m["date"]), "md": md, "plain": plain.strip(),
+        "urls": entity_urls(ents, plain), "media": media, "missing": missing, "kind": kind,
+        "file_name": m.get("file_name"),
+        "from": m.get("forwarded_from") or m.get("saved_from"),
+    }
+
+
+def tg_ai_view(it: dict) -> dict:
+    v = {"id": it["id"], "date": f"{it['date']:%Y-%m-%d}", "text": it["plain"][:1500]}
+    if it["from"]:
+        v["forwarded_from"] = it["from"]
+    if it["kind"]:
+        v["attachment"] = it["kind"] + (f" {it['file_name']}" if it["file_name"] else "")
+    page = it.get("page") or {}
+    if page.get("title"):
+        v["link_title"] = page["title"]
+    if page.get("description"):
+        v["link_description"] = page["description"][:400]
+    return v
+
+
+def tg_write(it: dict, meta: dict | None) -> str:
+    """Write the note for one message; returns its vault path (or "skipped")."""
+    if meta and meta.get("keep") is False:
+        skipped = VAULT / TELEGRAM / "_Skipped.md"
+        if not skipped.exists():
+            skipped.write_text("Saved messages Claude judged not worth a note. Nothing else is lost: "
+                               "make a note from any of these by hand.\n\n")
+        with skipped.open("a") as f:
+            text = re.sub(r"\s+", " ", it["plain"])[:300] or f"[{it['kind'] or 'empty'}]"
+            f.write(f"- {it['date']:%Y-%m-%d} · tg {it['id']} · {text}\n")
+        return "skipped"
+    meta = meta or {}
+    page = it.get("page") or {}
+    label = MEDIA_LABEL.get(it["kind"] or "", "Photo" if it["kind"] == "photo" else "File")
+    title = (meta.get("title") or first_line_title(it["plain"]) or page.get("title")
+             or it["file_name"] or f"{label} from {it['from'] or 'Saved Messages'}")
+    body = it["md"]
+    if page.get("title") and len(URL_RE.sub("", it["plain"]).strip()) < 200:
+        body += f"\n\n> [!info] {page['title']}" + (f"\n> {page['description']}" if page.get("description") else "")
+    for src in it["media"]:
+        if src.exists():
+            body += f"\n\n![[{copy_attachment(src, "telegram", "tg" + it["id"] + "-")}]]"
+    for name in it["missing"]:
+        body += f"\n\n*({label.lower()} `{name}` was not included in the export)*"
+    fm = {"type": meta.get("type") or ("media" if it["media"] and not it["plain"] else "note"),
+          "tags": clean_tags(meta.get("tags")), "summary": meta.get("summary"),
+          "source": it["urls"][0] if it["urls"] else None, "created": it["date"],
+          "forwarded_from": it["from"], "telegram_id": int(it["id"])}
+    return write_note(TELEGRAM, f"{it['date']:%Y-%m-%d} {title}", fm, body or "*(empty)*").relative_to(VAULT).as_posix()
+
+
+def cmd_telegram(args) -> None:
+    export = find_export(args.export)
+    root = export.parent
+    msgs = load_export(export)
+    (VAULT / TELEGRAM).mkdir(parents=True, exist_ok=True)
+    state_file = VAULT / TELEGRAM / ".import-state.json"
+    state = json.loads(state_file.read_text()) if state_file.exists() else {"done": {}}
+    done: dict = state["done"]
+
+    todo = [tg_item(m, root) for m in msgs if str(m["id"]) not in done]
+    log(f"{export}\n{len(msgs)} messages, {len(msgs) - len(todo)} already imported, {len(todo)} to go")
+    if args.limit:
+        todo = todo[: args.limit]
+    if not todo:
+        return
+
+    def save():
+        state_file.write_text(json.dumps(state, ensure_ascii=False, indent=0))
+
+    # Nothing for Claude to read: stickers/GIFs on their own are skipped, bare photos/files kept.
+    ai_todo = []
+    for it in todo:
+        if it["plain"]:
+            ai_todo.append(it)
+        elif it["kind"] in ("sticker", "animation") or not (it["media"] or it["missing"]):
+            done[it["id"]] = tg_write(it, {"keep": False})
+        else:
+            done[it["id"]] = tg_write(it, None)
+    save()
+
+    # Messages that are mostly a link: fetch the page title so Claude knows what it is.
+    linky = [it for it in ai_todo if it["urls"] and len(URL_RE.sub("", it["plain"]).strip()) < 200]
+    if linky and not args.no_fetch:
+        log(f"fetching {len(linky)} link title(s)…")
+        with ThreadPoolExecutor(16) as ex:
+            for it, info in zip(linky, ex.map(lambda it: page_info(it["urls"][0], timeout=10), linky)):
+                it["page"] = info
+
+    tags = vault_tags()
+    batches = [ai_todo[i: i + args.batch] for i in range(0, len(ai_todo), args.batch)]
+    n_done, skipped, t0 = 0, 0, time.time()
+    with ThreadPoolExecutor(args.jobs) as ex:
+        pending: dict = {}
+
+        def submit():
+            b = batches.pop(0)
+            known = [t for t, _ in tags.most_common(150)]
+            pending[ex.submit(ai_classify, [tg_ai_view(it) for it in b], known)] = b
+
+        while batches and len(pending) < args.jobs:
+            submit()
+        while pending:
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                batch = pending.pop(fut)
+                metas = fut.result() or {}
+                for it in batch:
+                    meta = metas.get(it["id"])
+                    path = tg_write(it, meta)
+                    done[it["id"]] = path
+                    skipped += path == "skipped"
+                    if meta and path != "skipped":
+                        tags.update(clean_tags(meta.get("tags")))
+                n_done += len(batch)
+                save()
+                log(f"  {n_done}/{len(ai_todo)} filed ({skipped} skipped, {time.time() - t0:.0f}s)")
+                if batches:
+                    submit()
+    log(f"done: {len(todo)} messages → {VAULT / TELEGRAM}  (skipped ones are listed in _Skipped.md)")
+
+
+# ── setup ─────────────────────────────────────────────────────────────────────
+
+MK = "org.gnome.settings-daemon.plugins.media-keys"
+MK_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+HOTKEYS = [("kb-capture", "Knowledge base: quick capture", "<Super><Alt>n", "capture"),
+           ("kb-file", "Knowledge base: add files", "<Super><Alt>f", "file"),
+           ("kb-open", "Knowledge base: open Obsidian", "<Super><Alt>o", "open")]
+
+
+def gvariant_str(s: str) -> str:
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def bind_hotkeys() -> None:
+    if not shutil.which("gsettings"):
+        log("gsettings not found, skipping hotkeys")
+        return
+    cur_raw = subprocess.run(["gsettings", "get", MK, "custom-keybindings"], capture_output=True, text=True).stdout
+    cur = ast.literal_eval(cur_raw.replace("@as ", "").strip() or "[]")
+    for slug, name, binding, sub in HOTKEYS:
+        path = f"{MK_PATH}{slug}/"
+        if path not in cur:
+            cur.append(path)
+        schema = f"{MK}.custom-keybinding:{path}"
+        for key, val in (("name", name), ("command", f'bash -lc "kb {sub}"'), ("binding", binding)):
+            subprocess.run(["gsettings", "set", schema, key, gvariant_str(val)], check=True)
+        log(f"hotkey  {binding:<16} kb {sub}")
+    subprocess.run(["gsettings", "set", MK, "custom-keybindings", str(cur)], check=True)
+
+
+def register_vault() -> None:
+    """Add the vault to Obsidian's vault list so it opens there on first launch."""
+    cfg = HOME / ".config" / "obsidian" / "obsidian.json"
+    data = json.loads(cfg.read_text()) if cfg.exists() else {}
+    vaults = data.setdefault("vaults", {})
+    if any(Path(v.get("path", "")) == VAULT for v in vaults.values()):
+        return
+    if subprocess.run(["pgrep", "-x", "obsidian"], capture_output=True).returncode == 0:
+        log("Obsidian is running: open the vault there with 'Open folder as vault' → " + str(VAULT))
+        return
+    for v in vaults.values():
+        v.pop("open", None)
+    vaults[hashlib.md5(str(VAULT).encode()).hexdigest()[:16]] = {"path": str(VAULT), "ts": int(time.time() * 1000),
+                                                                 "open": True}
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps(data))
+    log("vault   registered with Obsidian")
+
+
+def cmd_setup(args) -> None:
+    tpl = CONF_DIR / "vault-template"
+    fresh_config = not (VAULT / ".obsidian").exists()
+    for src in sorted(tpl.rglob("*")):
+        rel = src.relative_to(tpl)
+        if src.is_dir() or (rel.parts[0] == ".obsidian" and not fresh_config):
+            continue
+        dst = VAULT / rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+    for d in (INBOX, TELEGRAM, ATTACH, "Daily"):
+        (VAULT / d).mkdir(parents=True, exist_ok=True)
+    log(f"vault   {VAULT}" + ("" if fresh_config else "  (kept its existing .obsidian settings)"))
+    register_vault()
+    if not args.no_hotkeys:
+        bind_hotkeys()
+    import trafilatura  # noqa: F401  (also makes uv fetch the dependencies now, not on the first hotkey press)
+
+
+SAVE_CONFIG = ["app.json", "appearance.json", "hotkeys.json", "core-plugins.json", "community-plugins.json",
+               "daily-notes.json", "templates.json", "types.json", "snippets", "themes", "plugins"]
+
+
+def cmd_save_config(args) -> None:
+    src = VAULT / ".obsidian"
+    dst = (CONF_DIR / "vault-template" / ".obsidian").resolve()
+    if not src.exists():
+        die(f"{src} does not exist")
+    for name in SAVE_CONFIG:
+        s = src / name
+        if s.is_dir():
+            # plugins/*/data.json holds plugin settings, which can include API keys: the dotfiles repo is public
+            ignore = None if args.with_plugin_data else shutil.ignore_patterns("data.json")
+            shutil.copytree(s, dst / name, dirs_exist_ok=True, ignore=ignore)
+        elif s.exists():
+            dst.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, dst / name)
+    log(f"copied Obsidian settings to {dst}\nreview and commit them in the dotfiles repo"
+        + ("" if args.with_plugin_data else " (plugin data.json files were left out)"))
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="kb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("capture").set_defaults(fn=cmd_capture)
+    sub.add_parser("file").set_defaults(fn=cmd_file)
+    sub.add_parser("open").set_defaults(fn=cmd_open)
+    p = sub.add_parser("add")
+    p.add_argument("what", nargs="+")
+    p.set_defaults(fn=cmd_add)
+    p = sub.add_parser("telegram", help="import a Telegram Desktop export (default: newest in ~/Downloads/Telegram Desktop)")
+    p.add_argument("export", nargs="?", help="export folder or its result.json")
+    p.add_argument("--limit", type=int, help="only import the first N new messages (try it out)")
+    p.add_argument("--batch", type=int, default=20, help="messages per Claude call (default 20)")
+    p.add_argument("--jobs", type=int, default=4, help="parallel Claude calls (default 4)")
+    p.add_argument("--no-fetch", action="store_true", help="don't fetch link titles")
+    p.set_defaults(fn=cmd_telegram)
+    p = sub.add_parser("setup")
+    p.add_argument("--no-hotkeys", action="store_true")
+    p.set_defaults(fn=cmd_setup)
+    p = sub.add_parser("save-config")
+    p.add_argument("--with-plugin-data", action="store_true", help="also copy plugins/*/data.json (may hold secrets)")
+    p.set_defaults(fn=cmd_save_config)
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        if INTERACTIVE:
+            raise
+        die(f"{type(e).__name__}: {e}")
+
+
+if __name__ == "__main__":
+    main()
