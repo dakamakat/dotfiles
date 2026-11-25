@@ -7,7 +7,3 @@
 # kitty / alacritty local overrides
 .config/kitty/*.bak
 .config/kitty/*.save
-
-# kb: per-machine settings
-.config/kb/local.env
-__pycache__/

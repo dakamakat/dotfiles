@@ -20,7 +20,6 @@ FILES=(
   .zprofile
   .gitconfig
   .ideavimrc
-  .local/bin/kb
 )
 
 # Whole directories under ~/.config (linked as a directory so tools that
@@ -30,7 +29,6 @@ CONFIG_DIRS=(
   kitty
   alacritty
   git
-  kb
 )
 
 run() {
@@ -65,28 +63,6 @@ else
     echo "clone   zsh-syntax-highlighting"
     run git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git "$plugin"
   fi
-fi
-
-# Obsidian + kb (knowledge-base capture: hotkeys, Telegram import)
-if ! command -v obsidian >/dev/null 2>&1; then
-  if command -v snap >/dev/null 2>&1; then
-    echo "install obsidian (snap, asks for sudo)"
-    run sudo snap install obsidian --classic
-  else
-    echo "note    install Obsidian: https://obsidian.md/download"
-  fi
-fi
-missing=()
-for bin in zenity wl-paste notify-send pdftotext; do
-  command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
-done
-((${#missing[@]})) && echo "note    kb wants ${missing[*]}: sudo apt install zenity wl-clipboard libnotify-bin poppler-utils"
-command -v claude >/dev/null 2>&1 || echo "note    kb files notes with Claude Code: https://claude.com/claude-code (or set KB_AI=0)"
-if command -v uv >/dev/null 2>&1; then
-  echo "setup   kb: vault, Obsidian vault list, GNOME hotkeys"
-  run "$DOTFILES/.local/bin/kb" setup
-else
-  echo "note    kb needs uv: curl -LsSf https://astral.sh/uv/install.sh | sh, then: kb setup"
 fi
 
 echo "done."
